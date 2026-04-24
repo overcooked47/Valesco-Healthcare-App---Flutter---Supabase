@@ -62,12 +62,145 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
     super.dispose();
   }
 
-  final dosagePattern = RegExp(
-    r'(\d+(?:\.\d+)?)\s*(?:x\s*)?(\d+(?:\.\d+)?)?'
-    r'\s*(?:mg|mcg|μg|g|ml|cc|iu|IU|tabs?|tablet|capsule|caps?|drop|drops|dose|%)?'
-    r'(?:\s*(?:x|times|daily|per\s*day))?',
-    caseSensitive: false,
-  );
+  String _correctOcrErrors(String text) {
+    return text
+        .replaceAll(RegExp(r'[|1l](?=[a-z])'), 'i')
+        .replaceAll(RegExp(r'(?<=[a-z])[|1l]'), 'l')
+        .replaceAll('O', '0')
+        .replaceAll(RegExp(r'\bMg\b'), 'mg')
+        .replaceAll(RegExp(r'\bMcg\b'), 'mcg')
+        .replaceAll(RegExp(r'\bMl\b'), 'ml')
+        .replaceAll(RegExp(r'\bG\b'), 'g')
+        .replaceAll(RegExp(r'\bIu\b'), 'iu')
+        .replaceAll(RegExp(r'\bTab(?:let)?s?\b', caseSensitive: false), 'tablet')
+        .replaceAll(RegExp(r'\bCap(?:sule)?s?\b', caseSensitive: false), 'capsule');
+  }
+
+  List<Map<String, dynamic>> _findAllDosages(String text) {
+    final List<Map<String, dynamic>> dosages = [];
+
+    final betterPattern = RegExp(
+      r'\b(\d+(?:\.?\d+)?)\s*(?:mg|mcg|μg|g|ml|cc|iu|IU|%|units?)\b',
+      caseSensitive: false,
+    );
+
+    for (final match in betterPattern.allMatches(text)) {
+      final dosageText = text.substring(match.start, match.end).trim();
+      if (dosageText.isNotEmpty && !dosageText.contains(RegExp(r'^\d+$'))) {
+        dosages.add({
+          'text': dosageText,
+          'position': match.start,
+        });
+      }
+    }
+
+    return dosages;
+  }
+
+  List<Map<String, dynamic>> _analyzeLines(List<String> lines) {
+    final List<Map<String, dynamic>> analyzed = [];
+
+    for (int i = 0; i < lines.length; i++) {
+      final line = lines[i].trim();
+      if (line.isEmpty) continue;
+
+      final corrected = _correctOcrErrors(line);
+      final hasDosage = _findAllDosages(corrected).isNotEmpty;
+      final wordCount = line.split(RegExp(r'\s+\b')).length;
+
+      int score = 0;
+      if (hasDosage) score += 10;
+      if (wordCount <= 3 && !hasDosage) score += 8;
+      if (i <= 2) score += 5;
+      if (wordCount > 8) score -= 5;
+      if (RegExp(r'\b(indication|active|ingredient|use|direction|warning)\b', caseSensitive: false)
+          .hasMatch(line)) {
+        score -= 10;
+      }
+
+      analyzed.add({
+        'text': corrected,
+        'original': line,
+        'hasDosage': hasDosage,
+        'wordCount': wordCount,
+        'score': score,
+        'index': i,
+      });
+    }
+
+    return analyzed;
+  }
+
+  String _extractNameFromLine(String line) {
+    final nameOnlyPattern = RegExp(
+      r'^([^0-9]*?)(?=\d+\s*(?:mg|mcg|μg|g|ml|cc|iu|IU|%|tablet|capsule|drop))',
+      caseSensitive: false,
+    );
+
+    final match = nameOnlyPattern.firstMatch(line);
+    if (match != null) {
+      return match.group(1)!.trim();
+    }
+
+    return line
+        .replaceAll(RegExp(r'\s*(?:tablet|capsule|drop|dose|branded|generic)\s*', caseSensitive: false), '')
+        .replaceAll(RegExp(r'[\-–—].*$'), '')
+        .trim();
+  }
+
+  Map<String, String> _extractMedicationInfo(String text) {
+    if (text.trim().isEmpty) {
+      return {
+        'name': 'Unknown Medicine',
+        'dosage': 'Not specified',
+      };
+    }
+
+    final lines = text.split('\n').where((l) => l.trim().isNotEmpty).toList();
+    final analyzed = _analyzeLines(lines);
+
+    String bestMedicineName = '';
+    String bestDosage = '';
+
+    final dosageLines = analyzed.where((a) => a['hasDosage'] as bool).toList();
+    if (dosageLines.isNotEmpty) {
+      final dosageLine = dosageLines.first;
+      final lineText = dosageLine['text'] as String;
+      final dosages = _findAllDosages(lineText);
+
+      if (dosages.isNotEmpty) {
+        bestDosage = dosages.first['text'] as String;
+        bestMedicineName = _extractNameFromLine(lineText);
+      }
+    }
+
+    if (bestMedicineName.isEmpty && analyzed.isNotEmpty) {
+      final sortedByScore = analyzed..sort((a, b) => (b['score'] as int).compareTo(a['score'] as int));
+      bestMedicineName = _extractNameFromLine(sortedByScore.first['text'] as String);
+    }
+
+    bestMedicineName = bestMedicineName
+        .replaceAll(RegExp(r'^(brand\s*name|generic\s*name|medicine|drug)\s*:?\s*', caseSensitive: false), '')
+        .replaceAll(RegExp(r'[^a-zA-Z0-9\s\-]'), '')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+
+    if (bestMedicineName.length < 2) {
+      bestMedicineName = analyzed.firstWhere(
+        (a) => (a['wordCount'] as int) <= 3,
+        orElse: () => analyzed.isNotEmpty ? analyzed.first : {'text': ''},
+      )['text'] as String? ?? '';
+    }
+
+    if (bestMedicineName.length > 50) {
+      bestMedicineName = bestMedicineName.split(' ').take(3).join(' ');
+    }
+
+    return {
+      'name': bestMedicineName.isNotEmpty ? bestMedicineName : 'Unknown Medicine',
+      'dosage': bestDosage.isNotEmpty ? bestDosage : 'Not specified',
+    };
+  }
 
   void _autoFillMedicationFields(String ocrText) {
     final extracted = _extractMedicationInfo(ocrText);
@@ -84,240 +217,5 @@ class _AddMedicationScreenState extends State<AddMedicationScreen> {
         duration: const Duration(seconds: 2),
       ),
     );
-  }
-
-  Future<void> _scanMedicineLabel() async {
-    if (_isScanning) return;
-
-    setState(() {
-      _isScanning = true;
-    });
-
-    try {
-      final result = await OcrService.instance.scanText(source: ImageSource.camera);
-
-      if (!mounted || result == null) {
-        return;
-      }
-
-      if (!result.hasText) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No readable text was found in the image.'),
-          ),
-        );
-        return;
-      }
-
-      final messenger = ScaffoldMessenger.of(context);
-      await showModalBottomSheet<void>(
-        context: context,
-        isScrollControlled: true,
-        builder: (sheetContext) {
-          return SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'OCR Result',
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 12),
-                  const Text(
-                    'Review the extracted text and choose an option below.',
-                  ),
-                  const SizedBox(height: 12),
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: AppColors.grey100,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Text(
-                      result.rawText,
-                      style: const TextStyle(fontSize: 14),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Column(
-                    children: [
-                      ElevatedButton.icon(
-                        onPressed: () {
-                          Navigator.pop(sheetContext);
-                          _autoFillMedicationFields(result.rawText);
-                        },
-                        icon: const Icon(Icons.auto_awesome),
-                        label: const Text('Autofill Fields'),
-                        style: ElevatedButton.styleFrom(
-                          minimumSize: const Size(double.infinity, 48),
-                          backgroundColor: AppColors.primaryOrange,
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          Expanded(
-                            child: OutlinedButton.icon(
-                              onPressed: () async {
-                                final navigator = Navigator.of(sheetContext);
-                                await Clipboard.setData(
-                                  ClipboardData(text: result.rawText),
-                                );
-                                if (!mounted) return;
-                                navigator.pop();
-                                messenger.showSnackBar(
-                                  const SnackBar(
-                                    content: Text('OCR text copied to clipboard.'),
-                                  ),
-                                );
-                              },
-                              icon: const Icon(Icons.copy),
-                              label: const Text('Copy Text'),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: OutlinedButton(
-                              onPressed: () => Navigator.pop(sheetContext),
-                              child: const Text('Close'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      );
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('OCR scan failed: $e')),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isScanning = false;
-        });
-      }
-    }
-  }
-
-  Future<void> _saveMedication() async {
-    if (!_formKey.currentState!.validate()) return;
-
-    setState(() {
-      _isSaving = true;
-    });
-
-    try {
-      final authProvider = context.read<AuthProvider>();
-      final medicationProvider = context.read<MedicationProvider>();
-      final reminderService = MedicationReminderService.instance;
-
-      final userId = authProvider.currentUser?.id ?? 'user_1';
-      final medicationName = _nameController.text.trim();
-      final dosage = _dosageController.text.trim();
-      final notes = _notesController.text.trim().isEmpty 
-          ? null 
-          : _notesController.text.trim();
-
-      final medication = MedicationModel(
-        id: widget.medication?.id,
-        userId: userId,
-        name: medicationName,
-        dosage: dosage,
-        frequency: _selectedFrequency,
-        reminderTimes: _reminderTimes,
-        startDate: _startDate,
-        endDate: _endDate,
-        notes: notes,
-        totalPills: int.tryParse(_totalPillsController.text) ?? 30,
-        pillsRemaining: widget.medication?.pillsRemaining ?? 
-            (int.tryParse(_totalPillsController.text) ?? 30),
-      );
-
-      if (widget.medication == null) {
-        await medicationProvider.addMedication(medication);
-      } else {
-        await medicationProvider.updateMedication(medication);
-        if (!kIsWeb) {
-          await reminderService.cancelPlanReminders(medication.id);
-        }
-      }
-
-      if (!kIsWeb) {
-        final canSchedule = await reminderService.canScheduleExactNotifications();
-        if (!canSchedule) {
-          if (mounted) {
-            _showExactAlarmPermissionDialog();
-          }
-          setState(() => _isSaving = false);
-          return;
-        }
-
-        final now = DateTime.now();
-
-        for (int i = 0; i < _reminderTimes.length; i++) {
-          final reminderTime = _reminderTimes[i];
-
-          var scheduledDateTime = DateTime(
-            now.year,
-            now.month,
-            now.day,
-            reminderTime.hour,
-            reminderTime.minute,
-          );
-
-          if (scheduledDateTime.isBefore(now)) {
-            scheduledDateTime = scheduledDateTime.add(const Duration(days: 1));
-          }
-
-          await reminderService.scheduleSingleReminder(
-            userId: userId,
-            medicationName: '$medicationName - $dosage',
-            scheduledTime: scheduledDateTime,
-            notes: notes,
-          );
-        }
-
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                widget.medication == null
-                    ? 'Medication added!'
-                    : 'Medication updated successfully!',
-              ),
-              backgroundColor: AppColors.success,
-            ),
-          );
-          Navigator.pop(context);
-        }
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error: ${e.toString()}'),
-            backgroundColor: AppColors.error,
-          ),
-        );
-      }
-    } finally {
-      if (mounted) {
-        setState(() {
-          _isSaving = false;
-        });
-      }
-    }
   }
 }
